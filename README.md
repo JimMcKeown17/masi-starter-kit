@@ -29,6 +29,8 @@ The teaching flow is:
   Functions for loading Airtable data into pandas dataframes.
 - `data_import_functions/import_local_data_files.py`
   Functions for loading local sample CSV files into pandas dataframes.
+- `lessons/`
+  Beginner lesson prompts with practice tasks.
 - `sample_data/`
   Real Masi CSV files for beginner practice.
 - `.env.example`
@@ -149,6 +151,12 @@ The starter repo now includes these real Masi CSV files:
 - `sample_data/2025_childrens_results.csv`
 
 These files are for internal learning use only.
+
+## Lessons
+
+There is a beginner-friendly lessons folder in [lessons](/Users/jimmckeown/Development/masi-starter-repo/lessons).
+
+The lessons are task-based and do not include starter code.
 
 ## Ideas For First Lessons
 
