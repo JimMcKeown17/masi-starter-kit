@@ -10,6 +10,41 @@ load_dotenv()
 
 
 AIRTABLE_API_URL = "https://api.airtable.com/v0"
+LITERACY_SESSION_FRONT_COLUMNS = [
+    "Session Record",
+    "Literacy Coach Name",
+    "School",
+    "Site Type",
+    "Children in Session",
+    "Session Date",
+    "Created",
+    "Blending Level",
+    "Sounds Covered",
+    "Sounds Covered (Clean)",
+    "Sounds Covered 1",
+    "Sounds Covered 1 (Clean)",
+    "Sounds Covered 2",
+    "Sounds Covered 2 (Clean)",
+]
+YOUTH_FRONT_COLUMNS = [
+    "Employee ID",
+    "Full Name",
+    "First Names",
+    "Last Name",
+    "Job Title",
+    "Employment Status",
+    "Site Placement",
+    "Mentor",
+    "Basic Link",
+    "Office Link",
+    "Start Date",
+    "End Date",
+    "Gender",
+    "Race",
+    "Email",
+    "Cell Phone Number",
+    "City or Town",
+]
 
 
 def _get_airtable_token(airtable_token: str | None = None) -> str:
@@ -54,6 +89,19 @@ def _ensure_columns(dataframe: pd.DataFrame, columns: list[str]) -> pd.DataFrame
         if column not in dataframe.columns:
             dataframe[column] = None
     return dataframe
+
+
+def _move_existing_columns_to_front(
+    dataframe: pd.DataFrame,
+    front_columns: list[str],
+) -> pd.DataFrame:
+    existing_front_columns = [
+        column for column in front_columns if column in dataframe.columns
+    ]
+    remaining_columns = [
+        column for column in dataframe.columns if column not in existing_front_columns
+    ]
+    return dataframe[existing_front_columns + remaining_columns]
 
 
 def _normalize_airtable_dataframe(
@@ -105,6 +153,7 @@ def get_raw_airtable_records(
     table_name: str,
     airtable_token: str | None = None,
     view_name: str | None = None,
+    filter_formula: str | None = None,
 ) -> list[dict]:
     """
     Fetch all records from one Airtable table and return the raw Airtable records.
@@ -122,6 +171,8 @@ def get_raw_airtable_records(
             params["offset"] = offset
         if view_name:
             params["view"] = view_name
+        if filter_formula:
+            params["filterByFormula"] = filter_formula
 
         response = requests.get(url, headers=headers, params=params, timeout=30)
         response.raise_for_status()
@@ -155,6 +206,156 @@ def import_airtable_table(
     return pd.DataFrame([record.get("fields", {}) for record in records])
 
 
+def _as_airtable_record_id_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, float) and pd.isna(value):
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if item not in (None, "")]
+    if value == "":
+        return []
+    return [str(value)]
+
+
+def _resolve_airtable_record_ids(value, display_map: dict[str, str]) -> list[str]:
+    return [display_map.get(record_id, record_id) for record_id in _as_airtable_record_id_list(value)]
+
+
+def _get_children_record_ids_from_session(row) -> list[str]:
+    child_ids = _as_airtable_record_id_list(row.get("Children in Session"))
+    if child_ids:
+        return child_ids
+    return (
+        _as_airtable_record_id_list(row.get("Child 1"))
+        + _as_airtable_record_id_list(row.get("Child 2"))
+    )
+
+
+def _collect_literacy_session_linked_record_ids(dataframe: pd.DataFrame) -> dict[str, set[str]]:
+    linked_record_ids = {
+        "youth": set(),
+        "schools": set(),
+        "children": set(),
+    }
+
+    for _, row in dataframe.iterrows():
+        linked_record_ids["youth"].update(
+            _as_airtable_record_id_list(row.get("Literacy Coach Name"))
+        )
+        linked_record_ids["schools"].update(_as_airtable_record_id_list(row.get("School")))
+        linked_record_ids["children"].update(_get_children_record_ids_from_session(row))
+
+    return linked_record_ids
+
+
+def _build_record_id_filter_formula(record_ids: list[str]) -> str:
+    record_id_checks = [f"RECORD_ID()='{record_id}'" for record_id in record_ids]
+    if len(record_id_checks) == 1:
+        return record_id_checks[0]
+    return f"OR({','.join(record_id_checks)})"
+
+
+def _chunks(values: list[str], size: int):
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def _get_airtable_record_display_map(
+    base_id: str,
+    table_name: str,
+    display_field: str,
+    airtable_token: str | None = None,
+    record_ids: set[str] | None = None,
+) -> dict[str, str]:
+    if record_ids is not None and not record_ids:
+        return {}
+
+    if record_ids is None:
+        records = get_raw_airtable_records(
+            base_id=base_id,
+            table_name=table_name,
+            airtable_token=airtable_token,
+        )
+    else:
+        records = []
+        for record_id_chunk in _chunks(sorted(record_ids), 50):
+            records.extend(
+                get_raw_airtable_records(
+                    base_id=base_id,
+                    table_name=table_name,
+                    airtable_token=airtable_token,
+                    filter_formula=_build_record_id_filter_formula(record_id_chunk),
+                )
+            )
+
+    display_map = {}
+    for record in records:
+        display_value = record.get("fields", {}).get(display_field)
+        if isinstance(display_value, list):
+            display_value = _join_list_values(display_value)
+        if display_value not in (None, ""):
+            display_map[record["id"]] = str(display_value)
+    return display_map
+
+
+def _resolve_literacy_session_linked_names(
+    dataframe: pd.DataFrame,
+    youth_display_map: dict[str, str],
+    school_display_map: dict[str, str],
+    child_display_map: dict[str, str],
+) -> pd.DataFrame:
+    resolved_dataframe = dataframe.copy()
+
+    if "Literacy Coach Name" in resolved_dataframe.columns:
+        resolved_dataframe["Literacy Coach Record IDs"] = resolved_dataframe[
+            "Literacy Coach Name"
+        ].apply(_as_airtable_record_id_list)
+        resolved_dataframe["Literacy Coach Name"] = resolved_dataframe[
+            "Literacy Coach Name"
+        ].apply(lambda value: _resolve_airtable_record_ids(value, youth_display_map))
+
+    if "School" in resolved_dataframe.columns:
+        resolved_dataframe["School Record IDs"] = resolved_dataframe["School"].apply(
+            _as_airtable_record_id_list
+        )
+        resolved_dataframe["School"] = resolved_dataframe["School"].apply(
+            lambda value: _resolve_airtable_record_ids(value, school_display_map)
+        )
+
+    children_record_ids = [
+        _get_children_record_ids_from_session(row) for _, row in resolved_dataframe.iterrows()
+    ]
+
+    resolved_dataframe["Children in Session Record IDs"] = children_record_ids
+    resolved_dataframe["Children in Session"] = [
+        [child_display_map.get(record_id, record_id) for record_id in record_ids]
+        for record_ids in children_record_ids
+    ]
+
+    return resolved_dataframe
+
+
+def _resolve_youth_linked_names(dataframe: pd.DataFrame) -> pd.DataFrame:
+    resolved_dataframe = dataframe.copy()
+
+    if "Basic Link" in resolved_dataframe.columns:
+        resolved_dataframe["Basic Link Record IDs"] = resolved_dataframe[
+            "Basic Link"
+        ].apply(_as_airtable_record_id_list)
+        if "Full Name" in resolved_dataframe.columns:
+            resolved_dataframe["Basic Link"] = resolved_dataframe["Full Name"]
+
+    if "Office Link" in resolved_dataframe.columns:
+        resolved_dataframe["Office Link Record IDs"] = resolved_dataframe[
+            "Office Link"
+        ].apply(_as_airtable_record_id_list)
+        if "Site Placement" in resolved_dataframe.columns:
+            resolved_dataframe["Office Link"] = resolved_dataframe["Site Placement"]
+
+    return resolved_dataframe
+
+
 def import_airtable_schools(
     airtable_token: str | None = None,
 ) -> pd.DataFrame:
@@ -186,27 +387,45 @@ def import_airtable_schools(
 
 def import_airtable_literacy_sessions(
     airtable_token: str | None = None,
+    include_all_columns: bool = False,
 ) -> pd.DataFrame:
+    base_id = _get_required_env_var("AIRTABLE_MASI_WEEKLY_SESSIONS_BASE_ID")
     dataframe = import_airtable_table(
-        base_id=_get_required_env_var("AIRTABLE_MASI_WEEKLY_SESSIONS_BASE_ID"),
+        base_id=base_id,
         table_name=_get_required_env_var("AIRTABLE_MASI_WEEKLY_SESSIONS_TABLE_NAME"),
         airtable_token=airtable_token,
     )
 
-    return _normalize_airtable_dataframe(
+    linked_record_ids = _collect_literacy_session_linked_record_ids(dataframe)
+
+    dataframe = _resolve_literacy_session_linked_names(
         dataframe=dataframe,
-        joined_list_columns=[
-            "Literacy Coach Name",
-            "School",
-            "Children in Session",
-            "Child UID",
-            "Sounds Covered",
-            "Sounds Covered (Clean)",
-            "Site Type",
-        ],
-        datetime_columns=["Session Date", "Created"],
-        numeric_columns=["Children Count", "Capture Delay", "Sounds Token Count"],
-        selected_columns=[
+        youth_display_map=_get_airtable_record_display_map(
+            base_id=base_id,
+            table_name="Youth DB",
+            display_field="Name & Surname",
+            airtable_token=airtable_token,
+            record_ids=linked_record_ids["youth"],
+        ),
+        school_display_map=_get_airtable_record_display_map(
+            base_id=base_id,
+            table_name="Schools DB",
+            display_field="School",
+            airtable_token=airtable_token,
+            record_ids=linked_record_ids["schools"],
+        ),
+        child_display_map=_get_airtable_record_display_map(
+            base_id=base_id,
+            table_name="Child DB",
+            display_field="Canonical Full Name",
+            airtable_token=airtable_token,
+            record_ids=linked_record_ids["children"],
+        ),
+    )
+
+    selected_columns = None
+    if not include_all_columns:
+        selected_columns = [
             "Session Record",
             "Session UID",
             "Session Date",
@@ -222,8 +441,32 @@ def import_airtable_literacy_sessions(
             "Overall Session Status",
             "Capture Delay",
             "Created",
+        ]
+
+    cleaned_dataframe = _normalize_airtable_dataframe(
+        dataframe=dataframe,
+        joined_list_columns=[
+            "Literacy Coach Name",
+            "School",
+            "Children in Session",
+            "Literacy Coach Record IDs",
+            "School Record IDs",
+            "Children in Session Record IDs",
+            "Child UID",
+            "Sounds Covered",
+            "Sounds Covered (Clean)",
+            "Site Type",
         ],
+        datetime_columns=["Session Date", "Created"],
+        numeric_columns=["Children Count", "Capture Delay", "Sounds Token Count"],
+        selected_columns=selected_columns,
     )
+    if include_all_columns:
+        cleaned_dataframe = _move_existing_columns_to_front(
+            cleaned_dataframe,
+            LITERACY_SESSION_FRONT_COLUMNS,
+        )
+    return cleaned_dataframe
 
 
 def import_airtable_2025_assessments(
@@ -377,6 +620,7 @@ def import_airtable_staff(
 
 def import_airtable_youth(
     airtable_token: str | None = None,
+    include_all_columns: bool = False,
 ) -> pd.DataFrame:
     dataframe = import_airtable_table(
         base_id=_get_required_env_var("AIRTABLE_YOUTH_DB_BASE"),
@@ -384,22 +628,11 @@ def import_airtable_youth(
         airtable_token=airtable_token,
     )
 
-    return _normalize_airtable_dataframe(
-        dataframe=dataframe,
-        joined_list_columns=[
-            "Site Placement",
-            "Job Title",
-            "Employment Status",
-            "Mentor",
-            "Email",
-            "Cell Phone Number",
-            "Gender",
-            "Race",
-            "Start Date",
-            "End Date",
-        ],
-        datetime_columns=["DOB", "Start Date", "End Date"],
-        selected_columns=[
+    dataframe = _resolve_youth_linked_names(dataframe)
+
+    selected_columns = None
+    if not include_all_columns:
+        selected_columns = [
             "Employee ID",
             "Full Name",
             "First Names",
@@ -415,8 +648,38 @@ def import_airtable_youth(
             "Email",
             "Cell Phone Number",
             "City or Town",
+        ]
+
+    cleaned_dataframe = _normalize_airtable_dataframe(
+        dataframe=dataframe,
+        joined_list_columns=[
+            "Full Name",
+            "First Names",
+            "Last Name",
+            "Site Placement",
+            "Job Title",
+            "Employment Status",
+            "Mentor",
+            "Basic Link",
+            "Basic Link Record IDs",
+            "Office Link",
+            "Office Link Record IDs",
+            "Email",
+            "Cell Phone Number",
+            "Gender",
+            "Race",
+            "Start Date",
+            "End Date",
         ],
+        datetime_columns=["DOB", "Start Date", "End Date"],
+        selected_columns=selected_columns,
     )
+    if include_all_columns:
+        cleaned_dataframe = _move_existing_columns_to_front(
+            cleaned_dataframe,
+            YOUTH_FRONT_COLUMNS,
+        )
+    return cleaned_dataframe
 
 
 def import_airtable_numeracy_2026_sessions(
